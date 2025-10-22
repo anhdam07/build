@@ -12,14 +12,32 @@ notebook.  It keeps the behaviour of the original app:
 Example usage inside Colab::
 
     from google.colab import files
+    from IPython.display import display
     uploaded = files.upload()  # upload content.txt and subtitles.srt
-    from colab.pipeline import SubtitleWorkflow, prompt_for_gemini_api_key
+    from colab.pipeline import (
+        SubtitleWorkflow,
+        prompt_for_gemini_api_key,
+        create_notebook_inputs,
+        create_gemini_api_key_widget,
+    )
 
-    api_key = prompt_for_gemini_api_key()
+    # Display text boxes for manual data entry when files are unavailable.
+    inputs = create_notebook_inputs()
+    inputs.display()
+
+    # Optional password-style input dedicated to Gemini.
+    api_key_widget = create_gemini_api_key_widget()
+    display(api_key_widget)
+
+    api_key = api_key_widget.value or prompt_for_gemini_api_key()
     workflow = SubtitleWorkflow(api_key)
 
-    content_text = uploaded['content.txt'].decode('utf-8')
-    subtitle_text = uploaded['subtitles.srt'].decode('utf-8')
+    content_text = uploaded.get('content.txt', b'').decode('utf-8')
+    subtitle_text = uploaded.get('subtitles.srt', b'').decode('utf-8')
+
+    # Fallback to widget values if the user pasted text instead of uploading files.
+    if not content_text or not subtitle_text:
+        content_text, subtitle_text = inputs.get_text_inputs()
 
     analysis = workflow.analyse_content(content_text, subtitle_text)
     merged, merge_rules = workflow.merge_subtitles_from_analysis(
@@ -43,11 +61,19 @@ import re
 import time
 import textwrap
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import requests
 
 import google.generativeai as genai
+
+try:  # Widgets are optional but recommended inside Colab notebooks.
+    import ipywidgets as widgets
+except Exception:  # pragma: no cover - widgets unavailable in non-notebook envs.
+    widgets = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:  # pragma: no cover - typing helper for IDEs.
+    from ipywidgets import Widget
 
 
 @dataclass
@@ -86,6 +112,49 @@ class ImageGenerationResult:
 
 
 @dataclass
+class NotebookInputs:
+    """Interactive widgets that mirror the web workflow inside Colab."""
+
+    container: "Widget"
+    content_input: "Widget"
+    subtitle_input: "Widget"
+    merge_words_input: "Widget"
+    prompt_conditions_input: "Widget"
+    image_tokens_input: "Widget"
+    aspect_ratio_input: "Widget"
+
+    def display(self) -> None:
+        """Render the full widget set in the active notebook cell."""
+
+        try:
+            from IPython.display import display
+        except Exception as exc:  # pragma: no cover - display unavailable in tests.
+            raise RuntimeError("IPython display không khả dụng trong môi trường hiện tại.") from exc
+        display(self.container)
+
+    def get_text_inputs(self) -> Tuple[str, str]:
+        """Return the content and subtitle text as plain strings."""
+
+        return (str(getattr(self.content_input, "value", "")), str(getattr(self.subtitle_input, "value", "")))
+
+    def build_automation_kwargs(self) -> dict:
+        """Return keyword arguments ready for :meth:`SubtitleWorkflow.run_full_automation`."""
+
+        merge_words_config = str(getattr(self.merge_words_input, "value", "")).strip() or "5"
+        prompt_conditions = str(getattr(self.prompt_conditions_input, "value", "")).strip()
+        raw_tokens = str(getattr(self.image_tokens_input, "value", ""))
+        tokens = [token.strip() for token in raw_tokens.splitlines() if token.strip()]
+        aspect_ratio = str(getattr(self.aspect_ratio_input, "value", "16:9"))
+        return {
+            "merge_words_config": merge_words_config,
+            "prompt_conditions": prompt_conditions
+            or "cinematic, 4k, hyper-realistic, detailed, professional color grading, soft light",
+            "image_tokens": tokens,
+            "aspect_ratio": aspect_ratio,
+        }
+
+
+@dataclass
 class _SubtitleBlock:
     index: int
     start_time: str
@@ -110,6 +179,14 @@ class TokenError(RuntimeError):
     """Raised when an API token is rejected by the image generation endpoint."""
 
 
+def _ensure_widgets_available() -> "widgets":
+    if widgets is None:
+        raise ImportError(
+            "ipywidgets chưa được cài đặt. Vui lòng chạy `pip install ipywidgets` trong Colab rồi thử lại."
+        )
+    return widgets
+
+
 def configure_gemini(api_key: str) -> None:
     """Configure the google-generativeai SDK with the provided API key."""
 
@@ -129,6 +206,79 @@ def prompt_for_gemini_api_key(message: str = "Nhập Gemini API key: ") -> str:
     except (ImportError, EOFError):  # Fallback to input() if getpass fails.
         key = input(message)  # type: ignore[arg-type]
     return key.strip()
+
+
+def create_gemini_api_key_widget(
+    description: str = "Gemini API", *, placeholder: str = "Nhập API key"
+) -> "Widget":
+    """Return a password widget so users can paste the Gemini API key securely."""
+
+    widget_mod = _ensure_widgets_available()
+    return widget_mod.Password(
+        description=description,
+        placeholder=placeholder,
+        layout=widget_mod.Layout(width="100%"),
+    )
+
+
+def create_notebook_inputs(
+    *,
+    merge_words_default: str = "5;8;10",
+    prompt_conditions_default: str = "cinematic, 4k, hyper-realistic, detailed, professional color grading, soft light",
+    aspect_ratio_options: Optional[Sequence[str]] = None,
+) -> NotebookInputs:
+    """Create text areas mirroring the app's required inputs for Colab users."""
+
+    widget_mod = _ensure_widgets_available()
+    if aspect_ratio_options is None:
+        aspect_ratio_options = ("16:9", "1:1", "9:16")
+
+    content_input = widget_mod.Textarea(
+        description="Nội dung",
+        placeholder="Dán nội dung đã đánh số vào đây",
+        layout=widget_mod.Layout(width="100%", height="180px"),
+    )
+    subtitle_input = widget_mod.Textarea(
+        description="Phụ đề",
+        placeholder="Dán phụ đề SRT",
+        layout=widget_mod.Layout(width="100%", height="180px"),
+    )
+    merge_words_input = widget_mod.Text(
+        value=merge_words_default,
+        description="Gộp từ",
+        placeholder="Ví dụ: 5;8;10",
+        layout=widget_mod.Layout(width="50%"),
+    )
+    prompt_conditions_input = widget_mod.Textarea(
+        value=prompt_conditions_default,
+        description="Điều kiện",
+        layout=widget_mod.Layout(width="100%", height="120px"),
+    )
+    image_tokens_input = widget_mod.Textarea(
+        description="Bearer tokens",
+        placeholder="Mỗi dòng một token AI Sandbox (tùy chọn)",
+        layout=widget_mod.Layout(width="100%", height="120px"),
+    )
+    aspect_ratio_input = widget_mod.Dropdown(
+        options=list(aspect_ratio_options),
+        value=aspect_ratio_options[0],
+        description="Tỷ lệ",
+    )
+
+    column_layout = widget_mod.HBox([merge_words_input, aspect_ratio_input])
+    container = widget_mod.VBox(
+        [content_input, subtitle_input, column_layout, prompt_conditions_input, image_tokens_input]
+    )
+
+    return NotebookInputs(
+        container=container,
+        content_input=content_input,
+        subtitle_input=subtitle_input,
+        merge_words_input=merge_words_input,
+        prompt_conditions_input=prompt_conditions_input,
+        image_tokens_input=image_tokens_input,
+        aspect_ratio_input=aspect_ratio_input,
+    )
 
 
 def _clean_json_response(text: str) -> str:
@@ -576,9 +726,12 @@ __all__ = [
     "MergeRule",
     "ImagePromptResult",
     "ImageGenerationResult",
+    "NotebookInputs",
     "SubtitleWorkflow",
     "configure_gemini",
     "prompt_for_gemini_api_key",
+    "create_gemini_api_key_widget",
+    "create_notebook_inputs",
     "merge_srt_with_rules",
     "build_merge_rules",
 ]
